@@ -1,51 +1,34 @@
 # Notion Daily Task Automation
 
-This script creates one task per day in your Notion database and skips duplicates for the same date/title.
+Minimal daily task creator for Notion.
 
-## 1) Fill your env file
-
-Edit `.env`:
+## .env
 
 ```env
 NOTION_API_KEY=your_new_secret_here
-NOTION_DATABASE_ID=your_database_id_here
+NOTION_DATABASE_ID=your_database_or_data_source_id
+NOTION_API_VERSION=2025-09-03
 TIMEZONE=Europe/Rome
 TASK_TITLE_TEMPLATE=Daily Task - {date}
 DATE_LABEL_FORMAT=%Y-%m-%d
+NOTION_STATUS_PROPERTY=Status
+NOTION_STATUS_VALUE=Next Up
 ```
 
-Optional:
-
-```env
-# Force a specific date column name
-# NOTION_DATE_PROPERTY=Date
-
-# Set a status when creating the task
-# NOTION_STATUS_PROPERTY=Status
-# NOTION_STATUS_VALUE=Next Up
-```
-
-## 2) Connect integration to database
-
-In Notion:
-1. Open your task database page.
-2. `...` menu -> `Connections`.
-3. Add your integration.
-
-## 3) Test once
+## Run
 
 ```bash
 python3 main.py
 ```
 
-If successful, you'll see `Created: ...` or `Skipped: ...` if today's task already exists.
+## Behavior
 
-## 4) Schedule daily (cron example)
+- Creates one task per day.
+- If today's task already exists, it updates status to `Next Up` (if configured).
+- Auto-resolves `database_id` to `data_source_id` when needed.
 
-Run `crontab -e` and add:
+## Cron (daily at 08:00)
 
 ```cron
 0 8 * * * cd /Users/ermiasmulugetateklehaimanot/NEO/notion_A && /usr/bin/python3 main.py >> notion_daily.log 2>&1
 ```
-
-This runs every day at 08:00.

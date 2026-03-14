@@ -2,15 +2,14 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
-from dataclasses import dataclass
 from datetime import datetime
-from typing import Any
 from urllib import error, request
 from zoneinfo import ZoneInfo
 
-NOTION_BASE_URL = "https://api.notion.com/v1"
-NOTION_VERSION = "2022-06-28"
+NOTION_API_URL = "https://api.notion.com/v1"
+DEFAULT_NOTION_API_VERSION = "2025-09-03"
 
 
 def load_dotenv(path: str = ".env") -> None:
@@ -33,247 +32,212 @@ def load_dotenv(path: str = ".env") -> None:
                 os.environ[key] = value
 
 
-@dataclass
-class Config:
-    notion_api_key: str
-    notion_database_id: str
-    timezone: str
-    title_template: str
-    date_label_format: str
-    date_property: str | None
-    status_property: str | None
-    status_value: str | None
+def env(name: str, default: str | None = None) -> str:
+    value = os.getenv(name, default or "").strip()
+    if value:
+        return value
+    raise RuntimeError(f"Missing env var: {name}")
 
 
-class NotionClient:
-    def __init__(self, api_key: str):
-        self.api_key = api_key
+def normalize_notion_id(value: str) -> str:
+    value = value.strip()
+    if value.startswith("http://") or value.startswith("https://"):
+        match = re.search(r"([0-9a-fA-F]{32})", value)
+        if match:
+            value = match.group(1)
 
-    def _request(self, method: str, path: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
-        url = f"{NOTION_BASE_URL}{path}"
-        body = None if payload is None else json.dumps(payload).encode("utf-8")
-        req = request.Request(url=url, data=body, method=method)
-        req.add_header("Authorization", f"Bearer {self.api_key}")
-        req.add_header("Notion-Version", NOTION_VERSION)
-        req.add_header("Content-Type", "application/json")
-
-        try:
-            with request.urlopen(req, timeout=30) as resp:
-                raw = resp.read().decode("utf-8")
-                return json.loads(raw) if raw else {}
-        except error.HTTPError as exc:
-            details = exc.read().decode("utf-8", errors="replace")
-            raise RuntimeError(f"Notion API error {exc.code}: {details}") from exc
-        except error.URLError as exc:
-            raise RuntimeError(f"Network error calling Notion API: {exc.reason}") from exc
-
-    def retrieve_database(self, database_id: str) -> dict[str, Any]:
-        return self._request("GET", f"/databases/{database_id}")
-
-    def query_database(self, database_id: str, payload: dict[str, Any]) -> dict[str, Any]:
-        return self._request("POST", f"/databases/{database_id}/query", payload)
-
-    def create_page(self, payload: dict[str, Any]) -> dict[str, Any]:
-        return self._request("POST", "/pages", payload)
-
-
-def required_env(name: str) -> str:
-    value = os.getenv(name, "").strip()
-    if not value:
-        raise RuntimeError(f"Missing required env var: {name}")
-    bad_values = {
-        "replace_with_new_secret",
-        "replace_with_database_id",
-        "your_new_secret_here",
-        "your_database_id_here",
-    }
-    if value in bad_values or value.startswith("replace_with_"):
-        raise RuntimeError(f"Env var {name} still has a placeholder value.")
+    compact = value.replace("-", "")
+    if len(compact) == 32 and all(c in "0123456789abcdefABCDEF" for c in compact):
+        return (
+            f"{compact[0:8]}-"
+            f"{compact[8:12]}-"
+            f"{compact[12:16]}-"
+            f"{compact[16:20]}-"
+            f"{compact[20:32]}"
+        ).lower()
     return value
 
 
-def build_config() -> Config:
-    api_key = required_env("NOTION_API_KEY")
-    db_id = required_env("NOTION_DATABASE_ID")
-    timezone = os.getenv("TIMEZONE", "Europe/Rome").strip() or "Europe/Rome"
+def notion_request(api_key: str, api_version: str, method: str, path: str, payload: dict | None = None) -> dict:
+    body = None if payload is None else json.dumps(payload).encode("utf-8")
+    req = request.Request(f"{NOTION_API_URL}{path}", data=body, method=method)
+    req.add_header("Authorization", f"Bearer {api_key}")
+    req.add_header("Notion-Version", api_version)
+    req.add_header("Content-Type", "application/json")
 
-    return Config(
-        notion_api_key=api_key,
-        notion_database_id=db_id,
-        timezone=timezone,
-        title_template=os.getenv("TASK_TITLE_TEMPLATE", "Daily Task - {date}").strip() or "Daily Task - {date}",
-        date_label_format=os.getenv("DATE_LABEL_FORMAT", "%Y-%m-%d").strip() or "%Y-%m-%d",
-        date_property=(os.getenv("NOTION_DATE_PROPERTY") or "").strip() or None,
-        status_property=(os.getenv("NOTION_STATUS_PROPERTY") or "").strip() or None,
-        status_value=(os.getenv("NOTION_STATUS_VALUE") or "").strip() or None,
-    )
+    try:
+        with request.urlopen(req, timeout=30) as resp:
+            raw = resp.read().decode("utf-8")
+            return json.loads(raw) if raw else {}
+    except error.HTTPError as exc:
+        raw = exc.read().decode("utf-8", errors="replace")
+        try:
+            parsed = json.loads(raw)
+            code = parsed.get("code") or str(exc.code)
+            message = parsed.get("message") or raw
+            raise RuntimeError(f"{code}: {message}") from exc
+        except json.JSONDecodeError:
+            raise RuntimeError(f"HTTP {exc.code}: {raw}") from exc
+    except error.URLError as exc:
+        raise RuntimeError(f"Network error: {exc.reason}") from exc
 
 
-def pick_title_property(properties: dict[str, Any]) -> str:
-    for name, meta in properties.items():
-        if meta.get("type") == "title":
+def pick_first_property(properties: dict, kind: str, preferred: tuple[str, ...] = ()) -> str | None:
+    for name in preferred:
+        meta = properties.get(name)
+        if isinstance(meta, dict) and meta.get("type") == kind:
             return name
-    raise RuntimeError("No title property found in the Notion database.")
-
-
-def pick_date_property(properties: dict[str, Any], explicit: str | None) -> str | None:
-    if explicit:
-        if explicit not in properties:
-            raise RuntimeError(f"NOTION_DATE_PROPERTY '{explicit}' does not exist in database schema.")
-        if properties[explicit].get("type") != "date":
-            raise RuntimeError(f"NOTION_DATE_PROPERTY '{explicit}' exists but is not a date property.")
-        return explicit
-
-    preferred = {"date", "due date", "due", "day"}
     for name, meta in properties.items():
-        if meta.get("type") == "date" and name.strip().casefold() in preferred:
-            return name
-
-    for name, meta in properties.items():
-        if meta.get("type") == "date":
+        if isinstance(meta, dict) and meta.get("type") == kind:
             return name
     return None
 
 
-def pick_status_property(properties: dict[str, Any], explicit: str | None, status_value: str | None) -> tuple[str | None, str | None]:
-    if not status_value:
-        return None, None
-
-    if explicit:
-        if explicit not in properties:
-            raise RuntimeError(f"NOTION_STATUS_PROPERTY '{explicit}' does not exist in database schema.")
-        kind = properties[explicit].get("type")
-        if kind not in {"status", "select"}:
-            raise RuntimeError(
-                f"NOTION_STATUS_PROPERTY '{explicit}' must be type status/select, got '{kind}'."
-            )
-        return explicit, kind
-
-    for candidate in ("Status", "status"):
-        if candidate in properties and properties[candidate].get("type") in {"status", "select"}:
-            return candidate, properties[candidate].get("type")
-
-    for name, meta in properties.items():
-        if meta.get("type") in {"status", "select"}:
-            return name, meta.get("type")
-
-    raise RuntimeError(
-        "NOTION_STATUS_VALUE is set but no status/select property was found. "
-        "Set NOTION_STATUS_PROPERTY or remove NOTION_STATUS_VALUE."
-    )
+def option_name(prop: dict | None) -> str | None:
+    if not isinstance(prop, dict):
+        return None
+    for kind in ("status", "select"):
+        value = prop.get(kind)
+        if isinstance(value, dict):
+            name = value.get("name")
+            if isinstance(name, str) and name:
+                return name
+    return None
 
 
-def find_existing_page(
-    client: NotionClient,
-    database_id: str,
-    title_property: str,
-    title_value: str,
-    date_property: str | None,
-    date_iso: str,
-) -> dict[str, Any] | None:
-    if date_property:
-        filter_payload: dict[str, Any] = {
-            "and": [
-                {"property": date_property, "date": {"equals": date_iso}},
-                {"property": title_property, "title": {"equals": title_value}},
-            ]
-        }
-    else:
-        filter_payload = {"property": title_property, "title": {"equals": title_value}}
-
-    result = client.query_database(
-        database_id,
-        {
-            "filter": filter_payload,
-            "page_size": 1,
-        },
-    )
-
-    items = result.get("results", [])
-    return items[0] if items else None
+def notion_page_url(page_id: str) -> str:
+    return f"https://www.notion.so/{page_id.replace('-', '')}"
 
 
-def create_daily_task() -> None:
-    load_dotenv()
-    config = build_config()
+def resolve_parent(api_key: str, api_version: str, source_id: str) -> tuple[str, str, dict]:
+    source_id = normalize_notion_id(source_id)
 
+    # Try source as data_source_id
     try:
-        now = datetime.now(ZoneInfo(config.timezone))
-    except Exception as exc:
-        raise RuntimeError(f"Invalid TIMEZONE '{config.timezone}'. Example: Europe/Rome") from exc
+        data_source = notion_request(api_key, api_version, "GET", f"/data_sources/{source_id}")
+        return "data_source_id", source_id, data_source.get("properties", {})
+    except RuntimeError as exc:
+        if "object_not_found" not in str(exc):
+            raise
 
-    date_iso = now.date().isoformat()
-    date_label = now.strftime(config.date_label_format)
-    task_title = config.title_template.format(
-        date=date_label,
-        iso_date=date_iso,
-        weekday=now.strftime("%A"),
-    )
+    # Try source as database_id, then map to data_source_id when available
+    database = notion_request(api_key, api_version, "GET", f"/databases/{source_id}")
+    ds_list = database.get("data_sources", [])
+    if isinstance(ds_list, list) and ds_list and isinstance(ds_list[0], dict) and ds_list[0].get("id"):
+        ds_id = normalize_notion_id(str(ds_list[0]["id"]))
+        schema = notion_request(api_key, api_version, "GET", f"/data_sources/{ds_id}")
+        return "data_source_id", ds_id, schema.get("properties", {})
 
-    client = NotionClient(config.notion_api_key)
-    db = client.retrieve_database(config.notion_database_id)
-    properties = db.get("properties", {})
-    if not properties:
-        raise RuntimeError("Could not read database properties. Check database ID and integration access.")
-
-    title_property = pick_title_property(properties)
-    date_property = pick_date_property(properties, config.date_property)
-    status_property, status_kind = pick_status_property(properties, config.status_property, config.status_value)
-
-    existing = find_existing_page(
-        client=client,
-        database_id=config.notion_database_id,
-        title_property=title_property,
-        title_value=task_title,
-        date_property=date_property,
-        date_iso=date_iso,
-    )
-    if existing:
-        page_id = existing.get("id", "unknown")
-        print(f"Skipped: task already exists for today (page_id={page_id})")
-        return
-
-    notion_properties: dict[str, Any] = {
-        title_property: {
-            "title": [
-                {
-                    "text": {
-                        "content": task_title,
-                    }
-                }
-            ]
-        }
-    }
-
-    if date_property:
-        notion_properties[date_property] = {"date": {"start": date_iso}}
-
-    if status_property and status_kind and config.status_value:
-        if status_kind == "status":
-            notion_properties[status_property] = {"status": {"name": config.status_value}}
-        else:
-            notion_properties[status_property] = {"select": {"name": config.status_value}}
-
-    created = client.create_page(
-        {
-            "parent": {"database_id": config.notion_database_id},
-            "properties": notion_properties,
-        }
-    )
-
-    page_id = created.get("id", "unknown")
-    print(f"Created: {task_title} (page_id={page_id})")
-    print(f"Resolved properties: title='{title_property}', date='{date_property}', status='{status_property}'")
+    return "database_id", source_id, database.get("properties", {})
 
 
 def main() -> int:
-    try:
-        create_daily_task()
+    load_dotenv()
+
+    api_key = env("NOTION_API_KEY")
+    source_id = env("NOTION_DATABASE_ID")
+    api_version = os.getenv("NOTION_API_VERSION", DEFAULT_NOTION_API_VERSION).strip() or DEFAULT_NOTION_API_VERSION
+    timezone = os.getenv("TIMEZONE", "Europe/Rome").strip() or "Europe/Rome"
+    title_template = os.getenv("TASK_TITLE_TEMPLATE", "Daily Task - {date}").strip() or "Daily Task - {date}"
+    date_format = os.getenv("DATE_LABEL_FORMAT", "%Y-%m-%d").strip() or "%Y-%m-%d"
+    date_property_env = (os.getenv("NOTION_DATE_PROPERTY") or "").strip() or None
+    status_property_env = (os.getenv("NOTION_STATUS_PROPERTY") or "").strip() or None
+    status_value = (os.getenv("NOTION_STATUS_VALUE") or "").strip() or None
+
+    now = datetime.now(ZoneInfo(timezone))
+    today_iso = now.date().isoformat()
+    title = title_template.format(date=now.strftime(date_format), iso_date=today_iso, weekday=now.strftime("%A"))
+
+    parent_key, parent_id, properties = resolve_parent(api_key, api_version, source_id)
+    if not isinstance(properties, dict) or not properties:
+        raise RuntimeError("Could not read database properties")
+
+    title_property = pick_first_property(properties, "title")
+    if not title_property:
+        raise RuntimeError("No title property found")
+
+    if date_property_env:
+        if properties.get(date_property_env, {}).get("type") != "date":
+            raise RuntimeError(f"Invalid NOTION_DATE_PROPERTY: {date_property_env}")
+        date_property = date_property_env
+    else:
+        date_property = pick_first_property(properties, "date", ("Due Date", "Date", "due date", "date"))
+
+    if status_value:
+        if status_property_env:
+            status_property = status_property_env
+            status_type = properties.get(status_property, {}).get("type")
+            if status_type not in {"status", "select"}:
+                raise RuntimeError(f"Invalid NOTION_STATUS_PROPERTY: {status_property}")
+        else:
+            status_property = pick_first_property(properties, "status", ("Status", "status"))
+            status_type = "status" if status_property else None
+            if not status_property:
+                status_property = pick_first_property(properties, "select", ("Status", "status"))
+                status_type = "select" if status_property else None
+            if not status_property:
+                raise RuntimeError("No status/select property found")
+    else:
+        status_property = None
+        status_type = None
+
+    if date_property:
+        filters: dict = {
+            "and": [
+                {"property": title_property, "title": {"equals": title}},
+                {"property": date_property, "date": {"equals": today_iso}},
+            ]
+        }
+    else:
+        filters = {"property": title_property, "title": {"equals": title}}
+
+    query_path = f"/data_sources/{parent_id}/query" if parent_key == "data_source_id" else f"/databases/{parent_id}/query"
+    existing = notion_request(api_key, api_version, "POST", query_path, {"filter": filters, "page_size": 1}).get("results", [])
+
+    if existing:
+        page = existing[0]
+        page_id = str(page.get("id", ""))
+
+        if status_property and status_type and status_value:
+            current = option_name(page.get("properties", {}).get(status_property))
+            if current != status_value and page_id:
+                notion_request(
+                    api_key,
+                    api_version,
+                    "PATCH",
+                    f"/pages/{page_id}",
+                    {"properties": {status_property: {status_type: {"name": status_value}}}},
+                )
+                print(f"updated {notion_page_url(page_id)}")
+                return 0
+
+        print(f"exists {notion_page_url(page_id) if page_id else 'existing page'}")
         return 0
-    except RuntimeError as exc:
-        print(f"Error: {exc}", file=sys.stderr)
-        return 1
+
+    new_properties: dict = {
+        title_property: {"title": [{"text": {"content": title}}]},
+    }
+    if date_property:
+        new_properties[date_property] = {"date": {"start": today_iso}}
+    if status_property and status_type and status_value:
+        new_properties[status_property] = {status_type: {"name": status_value}}
+
+    created = notion_request(
+        api_key,
+        api_version,
+        "POST",
+        "/pages",
+        {"parent": {parent_key: parent_id}, "properties": new_properties},
+    )
+
+    page_id = str(created.get("id", ""))
+    print(f"created {notion_page_url(page_id) if page_id else 'page'}")
+    return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except Exception as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        raise SystemExit(1)
