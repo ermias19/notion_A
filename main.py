@@ -81,6 +81,14 @@ def required_env(name: str) -> str:
     value = os.getenv(name, "").strip()
     if not value:
         raise RuntimeError(f"Missing required env var: {name}")
+    bad_values = {
+        "replace_with_new_secret",
+        "replace_with_database_id",
+        "your_new_secret_here",
+        "your_database_id_here",
+    }
+    if value in bad_values or value.startswith("replace_with_"):
+        raise RuntimeError(f"Env var {name} still has a placeholder value.")
     return value
 
 
